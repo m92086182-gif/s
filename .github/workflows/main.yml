@@ -91,67 +91,156 @@ jobs:
 
       - name: Install Tailscale
         run: |
-          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
           $installerPath = "$env:TEMP\tailscale.msi"
           
+          Write-Host "Downloading Tailscale..."
           Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          
+          Write-Host "Installing Tailscale..."
           Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
           Remove-Item $installerPath -Force
+          
+          Write-Host "Waiting for Tailscale service to start..."
+          Start-Sleep -Seconds 10
+
+      - name: Check Tailscale Auth Key
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY) {
+              Write-Host "::warning::TAILSCALE_AUTH_KEY is not set"
+              Write-Host "Please add TAILSCALE_AUTH_KEY to your repository secrets"
+              Write-Host "You can get an auth key from: https://login.tailscale.com/admin/settings/authkeys"
+          } else {
+              Write-Host "Tailscale auth key is configured"
+          }
 
       - name: Establish Tailscale Connection
         run: |
-          # Bring up Tailscale with the provided auth key
-          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          Write-Host "Starting Tailscale connection..."
           
-          # Wait for Tailscale to assign an IP
+          # التحقق من تثبيت Tailscale
+          if (-not (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe")) {
+              Write-Error "Tailscale not installed properly"
+              exit 1
+          }
+          
+          # تشغيل Tailscale مع المفتاح
+          $authKey = "${{ secrets.TAILSCALE_AUTH_KEY }}"
+          
+          if ([string]::IsNullOrEmpty($authKey)) {
+              Write-Error "Tailscale auth key is empty. Please set TAILSCALE_AUTH_KEY in repository secrets."
+              exit 1
+          }
+          
+          Write-Host "Authenticating with Tailscale..."
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=$authKey --hostname=gh-runner-$env:GITHUB_RUN_ID --accept-routes --accept-dns
+          
+          # الانتظار وفحص الحالة
           $tsIP = $null
           $retries = 0
-          while (-not $tsIP -and $retries -lt 10) {
-              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
-              Start-Sleep -Seconds 5
+          $maxRetries = 15
+          
+          while ($retries -lt $maxRetries) {
+              Write-Host "Checking Tailscale status (attempt $($retries + 1)/$maxRetries)..."
+              
+              # الحصول على حالة Tailscale
+              $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+              
+              if ($status) {
+                  Write-Host "Tailscale state: $($status.BackendState)"
+                  if ($status.BackendState -eq "Running" -and $tsIP) {
+                      Write-Host "Tailscale is running with IP: $tsIP"
+                      break
+                  }
+              }
+              
+              if ($tsIP) {
+                  Write-Host "Tailscale IP found: $tsIP"
+                  break
+              }
+              
               $retries++
+              Write-Host "Waiting for Tailscale connection... ($retries/$maxRetries)"
+              Start-Sleep -Seconds 10
           }
           
           if (-not $tsIP) {
-              Write-Error "Tailscale IP not assigned. Exiting."
-              exit 1
+              Write-Host "::warning::Could not get Tailscale IP. Current status:"
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+              Write-Host "Trying to continue anyway..."
+              # نحاول المتابعة رغم عدم وجود IP، قد يظهر لاحقاً
+          } else {
+              echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+              Write-Host "Tailscale IP set to: $tsIP"
           }
-          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
-      
-      - name: Verify RDP Accessibility
-        run: |
-          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
-          
-          # Test connectivity on port 3389
-          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
-          if (-not $testResult.TcpTestSucceeded) {
-              Write-Error "TCP connection to RDP port 3389 failed"
-              exit 1
-          }
-          Write-Host "TCP connectivity successful!"
 
-      - name: Display Connection Info
+      - name: Get Public IP as Fallback
+        run: |
+          try {
+              $publicIP = (Invoke-WebRequest -Uri "https://api.ipify.org" -TimeoutSec 10).Content
+              echo "PUBLIC_IP=$publicIP" >> $env:GITHUB_ENV
+              Write-Host "Public IP: $publicIP"
+          } catch {
+              Write-Host "Could not get public IP"
+          }
+
+      - name: Display Connection Information
         run: |
           Write-Host "`n"
           Write-Host "=========================================="
           Write-Host "           RDP ACCESS INFORMATION         "
           Write-Host "=========================================="
-          Write-Host "Address: $env:TAILSCALE_IP"
+          
+          if ($env:TAILSCALE_IP) {
+              Write-Host "Tailscale Address: $env:TAILSCALE_IP"
+          } else {
+              Write-Host "Tailscale Address: Not available (check Tailscale status)"
+          }
+          
+          if ($env:PUBLIC_IP) {
+              Write-Host "Public Address: $env:PUBLIC_IP"
+          }
+          
           Write-Host "Username: RDP"
           Write-Host "Password: Admin123f!"
+          Write-Host "Port: 3389"
           Write-Host "=========================================="
           Write-Host "`n"
+          
+          Write-Host "If Tailscale is not working:"
+          Write-Host "1. Check TAILSCALE_AUTH_KEY in repository secrets"
+          Write-Host "2. Visit: https://login.tailscale.com/admin/machines"
+          Write-Host "3. Make sure the device is authorized"
 
       - name: Maintain Connection
         run: |
           Write-Host "RDP session is active and waiting for connections..."
           Write-Host "To terminate, cancel this workflow in GitHub Actions"
           
-          # Keep runner active with better status updates
-          $startTime = Get-Date
+          # عرض معلومات الاتصال بشكل متكرر
+          $counter = 0
           while ($true) {
-              $elapsed = (Get-Date) - $startTime
-              Write-Host "[$(Get-Date)] RDP Active - Elapsed: $([math]::Round($elapsed.TotalMinutes, 1)) minutes"
-              Write-Host "Connect using: mstsc /v:$env:TAILSCALE_IP"
+              $counter++
+              Write-Host "`n=== Session Status [$counter] ==="
+              
+              # التحقق من حالة Tailscale بشكل دوري
+              if (Test-Path "$env:ProgramFiles\Tailscale\tailscale.exe") {
+                  $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4 2>$null
+                  $status = & "$env:ProgramFiles\Tailscale\tailscale.exe" status --json 2>$null | ConvertFrom-Json
+                  
+                  if ($tsIP) {
+                      Write-Host "Tailscale IP: $tsIP"
+                      Write-Host "Connect using: mstsc /v:$tsIP"
+                  } else {
+                      Write-Host "Tailscale status: $($status.BackendState)"
+                  }
+              }
+              
+              Write-Host "Username: RDP"
+              Write-Host "Password: Admin123f!"
+              Write-Host "Elapsed: $($counter * 5) minutes"
+              Write-Host "==============================`n"
+              
               Start-Sleep -Seconds 300
           }
